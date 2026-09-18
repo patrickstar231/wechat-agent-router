@@ -1,0 +1,8 @@
+# dsh-wechat-agent-router bundle patch —— host 平面挂载点。
+#
+# 只挂本插件自己的 host 入口（配置命名空间 + loopback 路由 + 会话预设包装）。
+# 不挂 preset 平面：本插件从不进入任何 Agent 预设的组合，它只在 host 平面
+# 干预「会话用哪个预设」这一个值（见 README 的"零侵入"说明）。
+- insert:
+    - id: wechat-agent-router
+      name: 'dsh-wechat-agent-router'
