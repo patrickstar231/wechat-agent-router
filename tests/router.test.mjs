@@ -100,27 +100,39 @@ test('describeRoutes：给出每个群的目标与命中的规则（UI 预览用
 
 // ── 2. 包装层 ──────────────────────────────────────────────────────────────────
 
-/** 假 apiProxy：与真实结构一致（普通对象 + 方法），并把每次调用记下来。 */
-function fakeApiProxy(items = []) {
+/**
+ * 假宿主服务：与 DSH 0.2.2-rc.1 的真实契约一致。
+ *   - sessions.create(request, signal?) 直接收请求对象（不再包 { rpcId, payload } 信封）；
+ *   - sessions.list() 直接返回 { items }（不再包 { result: { ok, value } }）；
+ *   - sessions.resolveAgent(sessionId) 返回 agent 对象；
+ *   - agentPresets.select(agent, agentPreset) 第一个参数是 agent 对象。
+ * 服务是普通对象 + 方法（与旧 apiProxy 一样可安全替换），并把每次调用记下来。
+ */
+function fakeServices(items = [], { selectImpl } = {}) {
   const calls = { create: [], select: [], list: 0 }
   const sessions = {
-    create: async (request) => {
-      calls.create.push(request.payload)
-      return { result: { ok: true, value: { sessionId: request.payload.sessionId, agentPreset: request.payload.agentPreset } } }
+    create: async (request, signal) => {
+      calls.create.push(request)
+      return { sessionId: request.sessionId, agentPreset: request.agentPreset }
     },
     list: async () => {
       calls.list += 1
-      return { result: { ok: true, value: { items } } }
+      return { items }
     },
+    resolveAgent: async (sessionId) => ({ sessionId, id: sessionId }),
   }
   const agentPresets = {
-    select: async (request) => {
-      calls.select.push(request.payload)
-      return { result: { ok: true, value: { agentPreset: request.payload.agentPreset } } }
+    select: async (agent, agentPreset) => {
+      calls.select.push({ sessionId: agent?.sessionId, agentPreset })
+      if (selectImpl) return selectImpl(agent, agentPreset)
+      return { agentPreset }
     },
   }
-  return { apiProxy: { sessions, agentPresets }, calls }
+  return { sessions, agentPresets, calls }
 }
+
+/** 旧别名：包装层测试历史上叫 fakeApiProxy，这里保留名字减少改动噪音。 */
+const fakeApiProxy = fakeServices
 
 const routing = (config) => (payload) => {
   const resolver = createGroupResolver(['京源对接群', '闲聊群'])
@@ -131,48 +143,48 @@ const routing = (config) => (payload) => {
 }
 
 test('包装 sessions.create：把路由算出的预设写进创建参数', async () => {
-  const { apiProxy, calls } = fakeApiProxy()
+  const { sessions, calls } = fakeServices()
   const installed = installSessionRouting({
-    apiProxy,
+    sessions,
     resolveRoute: routing({ enabled: true, defaultAgent: '', rules: [{ match: '对接', mode: 'contains', agent: 'iot' }] }),
   })
   assert.equal(installed.installed, true)
 
-  await apiProxy.sessions.create({ rpcId: 'r1', payload: { sessionId: sessionIdFor('京源对接群'), workspaceId: 'w', agentPreset: 'wechat' } })
+  // 新模型：create 直接收 request 对象（含 sessionId / workspaceId / agentPreset），不包信封。
+  await sessions.create({ sessionId: sessionIdFor('京源对接群'), workspaceId: 'w', agentPreset: 'wechat' })
   assert.equal(calls.create[0].agentPreset, 'iot', '命中规则 → 改写')
   assert.equal(calls.create[0].workspaceId, 'w', '其它字段原样带过去')
 
-  await apiProxy.sessions.create({ rpcId: 'r2', payload: { sessionId: sessionIdFor('闲聊群'), workspaceId: 'w', agentPreset: 'wechat' } })
+  await sessions.create({ sessionId: sessionIdFor('闲聊群'), workspaceId: 'w', agentPreset: 'wechat' })
   assert.equal(calls.create[1].agentPreset, 'wechat', '没命中 → 不动')
 
-  await apiProxy.sessions.create({ rpcId: 'r3', payload: { sessionId: 'other-session', workspaceId: 'w', agentPreset: 'wechat' } })
+  await sessions.create({ sessionId: 'other-session', workspaceId: 'w', agentPreset: 'wechat' })
   assert.equal(calls.create[2].agentPreset, 'wechat', '非群会话 → 不动')
 
-  await apiProxy.sessions.create({ rpcId: 'r4', payload: { sessionId: sessionIdFor('京源对接群'), workspaceId: 'w', agentPreset: 'iot' } })
+  await sessions.create({ sessionId: sessionIdFor('京源对接群'), workspaceId: 'w', agentPreset: 'iot' })
   assert.equal(calls.create[3].agentPreset, 'iot', '已经是目标预设 → 不动（避免无谓改写）')
 
   installed.restore()
-  await apiProxy.sessions.create({ rpcId: 'r5', payload: { sessionId: sessionIdFor('京源对接群'), workspaceId: 'w', agentPreset: 'wechat' } })
+  await sessions.create({ sessionId: sessionIdFor('京源对接群'), workspaceId: 'w', agentPreset: 'wechat' })
   assert.equal(calls.create[4].agentPreset, 'wechat', 'restore 后回归原样')
 })
 
 test('包装安装是幂等的，且路由函数抛错时放行原始调用（绝不阻断消息）', async () => {
-  const { apiProxy, calls } = fakeApiProxy()
-  assert.equal(installSessionRouting({ apiProxy, resolveRoute: () => null }).installed, true)
-  assert.equal(installSessionRouting({ apiProxy, resolveRoute: () => null }).already, true, '第二次安装是空操作')
+  const { sessions, calls } = fakeServices()
+  assert.equal(installSessionRouting({ sessions, resolveRoute: () => null }).installed, true)
+  assert.equal(installSessionRouting({ sessions, resolveRoute: () => null }).already, true, '第二次安装是空操作')
 
-  installSessionRouting({ apiProxy, resolveRoute: () => { throw new Error('故意炸') } })
   const warned = []
-  const proxy = fakeApiProxy()
-  installSessionRouting({ apiProxy: proxy.apiProxy, resolveRoute: () => { throw new Error('故意炸') }, warn: (message) => warned.push(message) })
-  await proxy.apiProxy.sessions.create({ rpcId: 'r', payload: { sessionId: sessionIdFor('京源对接群'), agentPreset: 'wechat' } })
+  const proxy = fakeServices()
+  installSessionRouting({ sessions: proxy.sessions, resolveRoute: () => { throw new Error('故意炸') }, warn: (message) => warned.push(message) })
+  await proxy.sessions.create({ sessionId: sessionIdFor('京源对接群'), agentPreset: 'wechat' })
   assert.equal(proxy.calls.create[0].agentPreset, 'wechat', '异常时按原参数创建')
   assert.equal(warned.length, 1, '并记一条 warn')
 })
 
-test('apiProxy 形状不对时明确报告未安装，而不是抛错', () => {
-  assert.equal(installSessionRouting({ apiProxy: undefined, resolveRoute: () => null }).installed, false)
-  assert.equal(installSessionRouting({ apiProxy: {}, resolveRoute: () => null }).reason, 'apiProxy.sessions 不可用')
+test('宿主 sessions 服务形状不对时明确报告未安装，而不是抛错', () => {
+  assert.equal(installSessionRouting({ sessions: undefined, resolveRoute: () => null }).installed, false)
+  assert.equal(installSessionRouting({ sessions: {}, resolveRoute: () => null }).reason, 'sessions 服务不可用')
 })
 
 test('补正：只切「空白且预设不对」的群会话，其余一律跳过', async () => {
@@ -180,52 +192,58 @@ test('补正：只切「空白且预设不对」的群会话，其余一律跳�
   const row = (over) => ({ sessionId: sessionIdFor('京源对接群'), agentPreset: 'wechat', blank: true, running: false, ...over })
 
   // 一个待补正 + 一个没命中规则 + 一个不属于任何监听群
-  const first = fakeApiProxy([
+  const first = fakeServices([
     row(),
     { sessionId: sessionIdFor('闲聊群'), agentPreset: 'wechat', blank: true, running: false },
     { sessionId: 'wechat-group-0000000000000000000000000000dead', agentPreset: 'wechat', blank: true, running: false },
   ])
-  const applied = await reconcileBlankSessions({ apiProxy: first.apiProxy, resolveRoute: routing(config) })
+  const applied = await reconcileBlankSessions({ sessions: first.sessions, agentPresets: first.agentPresets, resolveRoute: routing(config) })
   assert.equal(applied.ok, true)
   assert.deepEqual(applied.applied, [{ group: '京源对接群', agent: 'iot', previous: 'wechat' }])
+  // 新模型：select(agent, preset) 两参，agent 由 resolveAgent 解析而来（携带 sessionId）。
   assert.deepEqual(first.calls.select, [{ sessionId: sessionIdFor('京源对接群'), agentPreset: 'iot' }], '只对那一个发起 select')
 
   // 已有历史：DSH 不允许换预设，只记 skipped
-  const history = fakeApiProxy([row({ blank: false })])
-  const skipped = await reconcileBlankSessions({ apiProxy: history.apiProxy, resolveRoute: routing(config) })
+  const history = fakeServices([row({ blank: false })])
+  const skipped = await reconcileBlankSessions({ sessions: history.sessions, agentPresets: history.agentPresets, resolveRoute: routing(config) })
   assert.equal(skipped.applied.length, 0)
   assert.match(skipped.skipped[0].reason, /已有历史/)
   assert.equal(history.calls.select.length, 0, '不许对已有历史的会话发起 select')
 
   // 正在处理消息：跳过（此时 select 也可能撞上 running）
-  const running = fakeApiProxy([row({ running: true })])
-  const busy = await reconcileBlankSessions({ apiProxy: running.apiProxy, resolveRoute: routing(config) })
+  const running = fakeServices([row({ running: true })])
+  const busy = await reconcileBlankSessions({ sessions: running.sessions, agentPresets: running.agentPresets, resolveRoute: routing(config) })
   assert.match(busy.skipped[0].reason, /正在处理/)
   assert.equal(running.calls.select.length, 0)
 })
 
-test('补正：select 失败只记 failed，不抛错；apiProxy 缺失时明确报告', async () => {
-  const apiProxy = {
-    sessions: { list: async () => ({ result: { ok: true, value: { items: [{ sessionId: sessionIdFor('京源对接群'), agentPreset: 'wechat', blank: true, running: false }] } } }) },
-    agentPresets: { select: async () => ({ result: { ok: false, error: { message: 'agent-preset-locked' } } }) },
-  }
+test('补正：select 失败只记 failed，不抛错；锁定码按 agent-preset/locked 识别；服务缺失时明确报告', async () => {
+  const { sessions, agentPresets } = fakeServices(
+    [{ sessionId: sessionIdFor('京源对接群'), agentPreset: 'wechat', blank: true, running: false }],
+    { selectImpl: async () => { throw Object.assign(new Error('This session has already started'), { code: 'agent-preset/locked' }) } },
+  )
   const result = await reconcileBlankSessions({
-    apiProxy,
+    sessions,
+    agentPresets,
     resolveRoute: routing({ enabled: true, defaultAgent: '', rules: [{ match: '对接', mode: 'contains', agent: 'iot' }] }),
   })
   assert.equal(result.ok, true)
-  assert.equal(result.failed[0].error, 'agent-preset-locked')
+  // 锁定的空白会话按约定跳过（不算 failed），不抛错。
   assert.equal(result.applied.length, 0)
+  assert.equal(result.failed.length, 0)
+  assert.match(result.skipped[0].reason, /不允许换预设|已开始/)
 
-  const missing = await reconcileBlankSessions({ apiProxy: undefined, resolveRoute: () => null })
+  const missing = await reconcileBlankSessions({ sessions: undefined, resolveRoute: () => null })
   assert.equal(missing.ok, false)
-  assert.match(missing.error, /apiProxy/)
+  assert.match(missing.error, /sessions/)
 })
 
-test('unwrap：ok 为真取 value，否则抛错（与 bridge.ts 同语义）', () => {
+test('unwrap：旧信封 ok 为真取 value、否则抛错；新模型（值直返）原样返回', () => {
   assert.deepEqual(unwrap({ result: { ok: true, value: { a: 1 } } }), { a: 1 })
   assert.throws(() => unwrap({ result: { ok: false, error: { message: 'boom' } } }), /boom/)
-  assert.throws(() => unwrap(undefined), /rpc 调用失败/)
+  // 新模型：服务直接返回值，unwrap 原样返回（不再把 undefined 当失败）。
+  assert.deepEqual(unwrap({ a: 1 }), { a: 1 })
+  assert.equal(unwrap(undefined), undefined)
 })
 
 // ── 3. 配置读取 ────────────────────────────────────────────────────────────────

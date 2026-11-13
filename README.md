@@ -10,7 +10,7 @@ dsh plugin --profile web add dsh-wechat-agent-router
 
 装完重启 `dsh web`，设置里会出现 **微信路由** 分区。
 
-- **宿主要求**：`dsh` `0.1.0-rc.7`（见 `package.json` 的 `dsh.engines.dsh`）；Node `^22.19.0 || ^24.0.0`。
+- **宿主要求**：`dsh` `^0.2.2-rc.1`（见 `package.json` 的顶层 `engines.dsh`）；Node `^22.19.0 || ^24.0.0`。
 - **功能上依赖 `dsh-wechat-assistant`**：本插件不监听、不收发消息，它只干预「这个群的会话用哪个预设」。
   没装微信助手时插件能正常加载，但没有任何群可路由（面板里的群列表会是空的）。
 - **客户端产物随包分发**（`lib/client.js` 已提交），安装时不需要构建。
@@ -37,36 +37,39 @@ unwrap(await ctx.apiProxy.sessions.create(request({
 })))
 ```
 
-本插件在 host 平面把 **`apiProxy.sessions.create` 这一个方法**包一层，按 `sessionId` 反查群名、算出目标预设、改写 `agentPreset` 后放行。依据（实测 `dsh-host-apiproxy/lib/index.js`）：
+本插件在 host 平面把 **宿主 `sessions` 服务的 `create` 这一个方法**包一层，按 `sessionId` 反查群名、算出目标预设、改写 `agentPreset` 后放行。依据（实测 DSH `0.2.2-rc.1` 的 `dsh-api-session-controller` / `dsh-agent-preset-registry`）：
 
-- 域是实例属性上的**普通对象**（`this.sessions = api.sessions`），方法可安全替换；
+> 说明：DSH `0.2.2-rc.1` 已移除旧的 `apiProxy` 服务（整个宿主 0 次出现），会话能力拆成了两个可直接注入的宿主服务——`sessions`（`create` / `list` / `resolveAgent`）与 `agentPresets`（`list` / `remoteExportList` / `select`）。本插件已随之迁移，不再依赖 `apiProxy`，也不再使用 `{ rpcId, payload }` / `{ result: { ok, value } }` 这套 RPC 信封（新服务直接收请求对象、直接返回值）。
+
+- 域是实例属性上的**普通对象**，方法可安全替换；
 - `sessions.create` 的契约写明"同一 `sessionId` 重试返回同一个会话"（**幂等**），所以对已存在的会话改写参数不会产生副作用；
 - `sessions.list()` 的条目带 `blank`（是否还没跑过 turn）与 `agentPreset`（当前实际在跑的），所以"该不该补正"是**精确判断**而不是猜；
 - 群与会话是一一对应的**确定性**关系：`sessionId = 'wechat-group-' + sha256(群名).slice(0,32)`（`lib/router.js` 里复刻，并有回归测试锁住字面量）。
 
 ## 生效语义（重要）
 
-- **只对"空白会话"生效**：DSH 规定 `agentPreset.select` 仅允许在会话还没跑过 turn 时使用，聊过之后会返回 `agent-preset-locked`（历史里的工具调用属于旧组合，换掉会让日志自相矛盾）。
+- **只对"空白会话"生效**：DSH 规定 `agentPreset.select` 仅允许在会话还没跑过 turn 时使用，聊过之后会返回 `agent-preset/locked`（历史里的工具调用属于旧组合，换掉会让日志自相矛盾）。
 - 因此本插件做两件事：① 包装 `sessions.create`，让**新会话**从一开始就用对的预设；② 启动后（以及每次保存配置后）扫一遍现有群会话，把 **`blank === true` 且预设不对**的**补正**过来。
 - **已有历史的群会话不会被改动**，会一直保持原样（面板里显示「已有历史」）。这也是"只影响后续"的实现方式：不需要迁移历史，也不需要换 `sessionId`。
 - 改配置**对新会话即时生效**，无需重启 DSH。
 
 ## 配置
 
-写在 `~/.dsh/settings.yaml` 本插件自己的段里（不碰同事的 `wechat-assistant` 段，只**读**它的 `groups` 来知道有哪些群）：
+路由规则通过 **设置 → 微信路由** 界面配置（0.2.2-rc.1 起，配置来自本插件导出的 `Config` schema，标记为 volatile 的字段改完即时生效，无需重启）：
 
 ```yaml
-wechat-agent-router:
-  enabled: true            # 关闭 = 完全不干预
-  defaultAgent: ''         # 兜底；空串 = 不干预（沿用微信助手原本点名的 wechat）
-  rules:                   # 自上而下，第一条命中者生效
-    - match: 对接           # 群名关键字
-      mode: contains       # contains（默认，不区分大小写）| exact
-      agent: iot
-    - match: 群聊总结
-      mode: exact
-      agent: archive-agent
+enabled: true            # 关闭 = 完全不干预
+defaultAgent: ''         # 兜底；空串 = 不干预（沿用微信助手原本点名的 wechat）
+rules:                   # 自上而下，第一条命中者生效
+  - match: 对接           # 群名关键字
+    mode: contains       # contains（默认，不区分大小写）| exact
+    agent: iot
+  - match: 群聊总结
+    mode: exact
+    agent: archive-agent
 ```
+
+> 0.1.x 时代这套值写在 `~/.dsh/settings.yaml` 的 `wechat-agent-router` 段。0.2.2-rc.1 会把该文件迁移进 profile patch，直读会失效，所以本插件改为从**设置服务**读取当前值（并保留对旧 `settings.yaml` 的兜底直读，兼容未迁移的部署）。本插件只**读**同事 `wechat-assistant` 段的 `groups` 来知道有哪些群。
 
 界面入口：**设置 → 微信路由**（与「Agent 管理」并列）。面板里能看每个监听群**当前实际用的预设**与**路由算出的目标**，以及是否对得上。
 
@@ -76,7 +79,8 @@ wechat-agent-router:
 - **不支持私信**：`dsh-wechat-assistant` 的 Python 端只接受群聊目标（好友会话会直接报「监听目标不是群聊」），候选列表也只给群聊。要支持私信必须改它的传输层。
 - **不接管模型**：桥接每条消息都会把模型强制 select 成全局 `modelProvider/modelName`，会覆盖 Agent 预设里的模型设置。想让模型也跟着路由走，需要额外处理。
 - **依赖 `sessionId` 方案**：群名反查靠复刻的 `sha256('wechat-group-'+…)`。若上游改了算法，路由匹配不到群 → 自动退化为"不干预"（不会报错，但也不生效）；`tests/router.test.mjs` 用字面量锁住这个值就是为了尽早发现这种漂移。
-- 包装失败（`apiProxy` 形状变了等）时**明确报告**而不是静默：日志里会有 `会话预设包装未安装：…`，面板顶部也会给出提示。
+- **群名列表依赖上游 volatile**：0.2.2-rc.1 起监听群名（`wechat-assistant.groups`）只能从设置服务的 volatile 字段投影里读到；若上游 `dsh-wechat-assistant` 未把 `groups` 标 volatile，本插件读不到任何群 → 路由不生效。启动时会检测到"配了规则但无群名"并在日志给出明确告警。
+- 包装失败（宿主 `sessions` 服务形状变了等）时**明确报告**而不是静默：日志里会有 `会话预设包装未安装：…`，面板顶部也会给出提示。
 
 ## 开发
 
